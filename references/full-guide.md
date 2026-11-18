@@ -38,6 +38,25 @@
 
 权限改完后，有的租户要点“创建版本并发布”才生效。验收仍失败时先查已发布版本的权限快照，不要在本地反复重启撞运气。
 
+## 3b. 扫码创建应用（官方一键流程，2026-11-18 补）
+
+飞书开放平台官方提供「一键扫码创建应用」（文档：open.feishu.cn/document/mcp_open_tools/scan-to-create-an-app-in-one-click）：Python SDK `lark-oapi >= 1.5.5` 的 `lark.register_app()` 走 OAuth 2.0 设备授权流程（RFC 8628），程序出二维码、所有者用飞书/Lark App 扫码确认，SDK 直接把新应用的 `client_id` / `client_secret` 回给程序，不必再去开发者后台手动建应用、抄凭证。
+
+模板实现是 `bridge/scan_create_app.py`，在运行目录里跑（先装好 requirements）：
+
+```bash
+.venv/bin/python bridge/scan_create_app.py --name "MAC-codex"
+```
+
+它做的事：
+
+- 终端打印二维码（ASCII + `state/scan_qr.png`，流程结束即删图），同时打印二维码 URL；二维码有有效期，过期重跑即可。
+- 通过 `addons` 在平台基础模板之上预置本桥需要的权限与事件：tenant scopes `im:message.p2p_msg:readonly`、`im:message.group_at_msg:readonly`、`im:message:send_as_bot`、`im:resource:upload`，事件 `im.message.receive_v1`，回调 `card.action.trigger`。`addons` 只能叠加不能删减基础模板；目录外的名字会被确认页忽略；`security.*`、加密 key 等敏感配置不能走 addons，仍需后台处理（本桥长连接模式不需要）。
+- 扫码确认后把凭证写进 `credentials.json`（0600，即 `local_file` 模式）；把 `app_id`、按 `tenant_brand` 推出的 `base`/`api_host`（feishu → open.feishu.cn，lark → open.larksuite.com）写进 `config.json`，并把扫码人的 `open_id` 自动追加到 `allowed_open_ids`——白名单回填提前到建应用这一步完成。
+- 最后换一次 tenant token，只报 code/msg/expire；Secret 与 token 全程不打印。`credentials.json` 已有非空 app_id 时默认拒绝覆盖，`--force` 才换机器人；`--app-id cli_...` 可走「给已有应用补 addons 配置」的更新流程；`--create-only` 隐藏确认页的「选择已有应用」入口。
+- 边界：扫码建的应用在部分租户仍需企业管理员审批或发布版本后才可用，脚本结尾会提醒；消息不进来时先回开发者后台核对审批/发布状态与长连接事件订阅，不要反复重扫。国际版 Lark 由 SDK 按租户品牌自动切换 accounts 域名，但本桥对 Lark 的端到端仍未实测，扫码成功不等于 Lark 已验收。
+- 凭证模式：扫码路径天然把 Secret 落到本机程序手里，默认按 `local_file` 落盘。选了 `memory_only` 的所有者不要用这条路径落盘，仍走手动建应用 + stdin 注入。
+
 ## 4. 凭证处理：这次踩过的坑
 
 - Feishu 需要 App ID + Secret 一起放进 JSON 请求体换 `tenant_access_token`。只有“一个秘密值”的录入卡无法描述这对凭证；2026-10-07 的一次安全库 API 录入尝试就因此被拒。
@@ -103,6 +122,8 @@
 | API code 0 但用户没看到 | 检查是否发到正确 chat_id、机器人可用范围和用户端的会话 | 直接重复发送三遍 |
 | 杀子进程后不复活 | 看 supervisor 是否还活着、退避时间、凭证文件是否可读（只查存在和权限，不看内容） | 杀 supervisor 后只怪 daemon |
 | 整机重启后没恢复 | 看 health/cron/systemd 的实际唤醒证据；memory 模式需要所有者补发 | 声称心跳文件在就等于进程在 |
+| 扫码创建时二维码过期/被拒 | 过期直接重跑 `scan_create_app.py`；被拒（AppAccessDeniedError）说明扫码人拒绝或无建应用权限，换有权限的所有者扫 | 把二维码 URL 写进日志/报告长期留存，或拿旧码反复让用户扫 |
+| 扫码成功但消息不进来 | 先查租户是否要求管理员审批/发布版本，再核对长连接模式与 `im.message.receive_v1` 订阅是否在已发布版本里 | 反复重扫建一堆新应用，或断言扫码流程坏了 |
 
 ## 10. 停止与回滚
 
