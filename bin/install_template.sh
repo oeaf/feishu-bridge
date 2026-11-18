@@ -50,4 +50,5 @@ else
 fi
 
 echo "template installed at $TARGET"
-echo "next: choose credential mode, fill config.json, then follow CHECKLIST.md"
+echo "next: either scan-create the app (python bridge/scan_create_app.py, local_file mode)"
+echo "or choose credential mode manually, fill config.json, then follow CHECKLIST.md"
