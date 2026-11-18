@@ -32,6 +32,7 @@ start_bridge.sh -> bridge/supervisor.py -> bridge/bridge_daemon.py（子进程�
 - `bridge/supervisor.py`：子进程保活；从 stdin 或 `--credentials-file` 取凭证，只在内存持有并经管道喂给子进程。
 - `bridge/start_bridge.sh`：幂等一键启动；已运行则不重复启动。
 - `bridge/validate_credentials.py`：从运行目录 `credentials.json` 换 token，只输出 code/msg/expire。
+- `bridge/scan_create_app.py`：官方一键扫码创建应用（`lark.register_app`）——出二维码、所有者飞书扫码确认后自动把凭证写 `credentials.json`（0600）、回填 `config.json` 的 app_id/域名与扫码人白名单，并做一次 token 校验。已有非空凭证时拒绝覆盖。
 - `bridge/file_queue.py`：文件队列与 message_id 持久去重。
 - `bridge/generate_test_files.py`：生成 txt/png/mp4 验收文件。
 - `hooks/feishu_inbox.sh`：inbox 非空时唤醒处理 Agent 的检测脚本（Muse hooks 运行时专用）。
@@ -85,6 +86,10 @@ start_bridge.sh -> bridge/supervisor.py -> bridge/bridge_daemon.py（子进程�
 ```
 
 `path` 相对桥接运行目录或用绝对路径。文字和附件可同文件；daemon 逐个处理并只把飞书 code/msg 写进脱敏日志。
+
+## 快速开通（扫码创建）
+
+装好依赖后，在运行目录跑 `.venv/bin/python bridge/scan_create_app.py --name "<机器人名>"`，终端会出二维码；所有者用飞书 App 扫码确认，应用、凭证与白名单自动落好，省去手动建应用与抄 Secret。手动建应用的老流程仍保留，见 `CHECKLIST.md` 第 1B 节。扫码的原理、addons 权限清单与边界见上层 `references/full-guide.md` 第 3b 节。
 
 ## 先读主 skill
 

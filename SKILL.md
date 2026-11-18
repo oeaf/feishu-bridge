@@ -1,6 +1,6 @@
 ---
 name: "feishu_bridge"
-description: "把飞书/Lark 企业自建应用机器人桥接到 AI Agent：长连接收消息、文件队列、自动唤醒、进程保活、整机重启恢复、文字与文档/图片/视频附件双向收发。当用户要求新接、重连、续命、修复、升级或验收飞书机器人通道，或让另一个 Agent 按已跑通的流程直接上手飞书桥接时使用。已实测范围为中国飞书 open.feishu.cn 的私聊文字、出站文档/图片/视频附件与入站图片/视频自动下载到本地供 Agent 分析；国际版 Lark 和群聊需另行验收。"
+description: "把飞书/Lark 企业自建应用机器人桥接到 AI Agent：官方 register_app 扫码一键创建应用、长连接收消息、文件队列、自动唤醒、进程保活、整机重启恢复、文字与文档/图片/视频附件双向收发。当用户要求新接、重连、续命、修复、升级或验收飞书机器人通道，或让另一个 Agent 按已跑通的流程直接上手飞书桥接时使用。已实测范围为中国飞书 open.feishu.cn 的私聊文字、出站文档/图片/视频附件与入站图片/视频自动下载到本地供 Agent 分析；国际版 Lark 和群聊需另行验收。"
 metadata: { "includeInPrompt": true }
 ---
 
@@ -16,7 +16,7 @@ metadata: { "includeInPrompt": true }
 
 - 一键复制模板：`bin/install_template.sh [目标目录] [--install-deps]`
   默认部署到 `~/workspace/feishu-bridge`；只复制 `*.example`，不会生成真实 `credentials.json`，不会覆盖已有 `config.json`。
-- 模板进程：`assets/template/bridge/bridge_daemon.py`（收消息并下载入站附件、发消息/附件、重连、心跳）、`backfill_message.py`（补取已送达消息的入站附件）、`supervisor.py`（子进程保活）、`start_bridge.sh`（幂等启动）、`validate_credentials.py`（只输出脱敏校验结果）、`generate_test_files.py`（生成 txt/png/mp4）
+- 模板进程：`assets/template/bridge/bridge_daemon.py`（收消息并下载入站附件、发消息/附件、重连、心跳）、`backfill_message.py`（补取已送达消息的入站附件）、`supervisor.py`（子进程保活）、`start_bridge.sh`（幂等启动）、`validate_credentials.py`（只输出脱敏校验结果）、`generate_test_files.py`（生成 txt/png/mp4）、`scan_create_app.py`（官方一键扫码创建应用：`lark.register_app` 出二维码，所有者扫码确认后自动落凭证、回填 config 与扫码人白名单）
 - 模板钩子：`assets/template/hooks/feishu_inbox.sh` 与 `feishu_health.sh`，工作者原文见 `assets/template/hooks/prompts.md`。这是 Muse hooks 形态；其他 Agent 必须用等价轮询/任务机制实现同一 inbox/outbox 合同。
 - 部署清单：复制资产里的 `CHECKLIST.md` 跟着逐项打勾，不要凭记忆跳步。
 
@@ -37,7 +37,9 @@ metadata: { "includeInPrompt": true }
 
 ### 2. 飞书后台是所有者的动作
 
-向所有者给出明确清单并等待其在后台完成，不要假装已开通：机器人能力、私聊可用范围、长连接订阅 `im.message.receive_v1`、权限 `im:message.p2p_msg:readonly` 与 `im:message:send_as_bot`、出站附件权限 `im:resource:upload`（或 `im:resource`）、按后台要求发布新版本。入站附件下载走消息资源接口，本机实测现有私聊只读权限组合即可下载；若资源接口报缺权限，再补 `im:message:readonly`（或后台当时要求的等价只读权限）并重新发布后复测，不要先入为主地反复改代码。群聊再加 `im:message.group_at_msg:readonly` 并真验收。本 skill 的已验证形态是中国飞书；国际版 Lark 需要先验证 API/SDK 域名后单独跑通。
+新装优先走扫码创建（官方一键流程）：在运行目录装好依赖后跑 `bridge/scan_create_app.py`，所有者本人用飞书 App 扫终端二维码确认，应用创建、凭证落盘（`local_file` 模式，0600）、config 的 app_id/域名回填、扫码人 open_id 进白名单一次完成，权限与 `im.message.receive_v1` 事件由脚本的 addons 预置。扫码路径默认即 `local_file`；所有者选了 `memory_only` 时不要走扫码落盘。扫码后仍要核对：部分租户要管理员审批或发布版本才可用，消息不进来先查这一层，不要反复重扫。
+
+手动路径（或扫码后的核对清单）：向所有者给出明确清单并等待其在后台完成，不要假装已开通：机器人能力、私聊可用范围、长连接订阅 `im.message.receive_v1`、权限 `im:message.p2p_msg:readonly` 与 `im:message:send_as_bot`、出站附件权限 `im:resource:upload`（或 `im:resource`）、按后台要求发布新版本。入站附件下载走消息资源接口，本机实测现有私聊只读权限组合即可下载；若资源接口报缺权限，再补 `im:message:readonly`（或后台当时要求的等价只读权限）并重新发布后复测，不要先入为主地反复改代码。群聊再加 `im:message.group_at_msg:readonly` 并真验收。本 skill 的已验证形态是中国飞书；国际版 Lark 需要先验证 API/SDK 域名后单独跑通。
 
 ### 3. 部署与启动
 
