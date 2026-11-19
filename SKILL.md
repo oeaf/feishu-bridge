@@ -12,7 +12,7 @@ metadata: { "includeInPrompt": true }
 
 ## Tooling
 
-运行资产在本 skill 的 `assets/template/`，详细说明在 `references/full-guide.md`：
+运行资产在本 skill 的 `assets/template/`，详细说明在 `references/full-guide.md`，零 Token 保活方案（脚本自愈、Agent 只在持续 10 分钟修不好时才唤醒）在 `references/zero-token-keepalive.md`：
 
 - 一键复制模板：`bin/install_template.sh [目标目录] [--install-deps]`
   默认部署到 `~/workspace/feishu-bridge`；只复制 `*.example`，不会生成真实 `credentials.json`，不会覆盖已有 `config.json`。
