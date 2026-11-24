@@ -16,7 +16,7 @@ metadata: { "includeInPrompt": true }
 
 - 一键复制模板：`bin/install_template.sh [目标目录] [--install-deps]`
   默认部署到 `~/workspace/feishu-bridge`；只复制 `*.example`，不会生成真实 `credentials.json`，不会覆盖已有 `config.json`。
-- 模板进程：`assets/template/bridge/bridge_daemon.py`（收消息并下载入站附件、发消息/附件、重连、心跳）、`backfill_message.py`（补取已送达消息的入站附件）、`supervisor.py`（子进程保活）、`start_bridge.sh`（幂等启动）、`validate_credentials.py`（只输出脱敏校验结果）、`generate_test_files.py`（生成 txt/png/mp4）、`scan_create_app.py`（官方一键扫码创建应用：`lark.register_app` 出二维码，所有者扫码确认后自动落凭证、回填 config 与扫码人白名单）
+- 模板进程：`assets/template/bridge/bridge_daemon.py`（收消息并下载入站附件、发消息/附件、重连、断线后自动补收断线期间的消息、按 message_id 去重、心跳）、`backfill_message.py`（补取已送达消息的入站附件）、`supervisor.py`（子进程保活）、`start_bridge.sh`（幂等启动）、`validate_credentials.py`（只输出脱敏校验结果）、`generate_test_files.py`（生成 txt/png/mp4）、`scan_create_app.py`（官方一键扫码创建应用：`lark.register_app` 出二维码，所有者扫码确认后自动落凭证、回填 config 与扫码人白名单）
 - 模板钩子：`assets/template/hooks/feishu_inbox.sh` 与 `feishu_health.sh`，工作者原文见 `assets/template/hooks/prompts.md`。这是 Muse hooks 形态；其他 Agent 必须用等价轮询/任务机制实现同一 inbox/outbox 合同。
 - 部署清单：复制资产里的 `CHECKLIST.md` 跟着逐项打勾，不要凭记忆跳步。
 

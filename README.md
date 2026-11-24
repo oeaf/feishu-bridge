@@ -27,7 +27,7 @@ start_bridge.sh -> bridge/supervisor.py -> bridge/bridge_daemon.py（子进程�
 
 ## 目录
 
-- `bridge/bridge_daemon.py`：长连接收消息（文字/图片/文件/音频/视频）、入站附件下载到 `queue/incoming_attachments/`、outbox 文字/附件发送、断线重连、心跳。
+- `bridge/bridge_daemon.py`：长连接收消息（文字/图片/文件/音频/视频）、入站附件下载到 `queue/incoming_attachments/`、outbox 文字/附件发送、断线重连、断线后自动补收（重连钩子 + 启动补收，按 message_id 去重）、心跳。
 - `bridge/backfill_message.py`：按 message_id 补取已送达消息的入站附件；默认只下载校验，加 `--enqueue` 才入队。
 - `bridge/supervisor.py`：子进程保活；从 stdin 或 `--credentials-file` 取凭证，只在内存持有并经管道喂给子进程。
 - `bridge/start_bridge.sh`：幂等一键启动；已运行则不重复启动。
