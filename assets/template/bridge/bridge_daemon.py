@@ -457,6 +457,223 @@ HEARTBEAT_PATH = BASE_DIR / "state" / "heartbeat.json"
 _started_at = time.time()
 
 
+# ---------------------------------------------------------------------------
+# Reconnect backfill: pull messages sent while the WS long connection was
+# down, so a disconnect no longer silently drops user messages.
+#
+# Why this shape (measured 2026-11-24 against the live app):
+# - Permission is fine: GET /open-apis/im/v1/messages returns code 0
+#   (im:message:readonly is granted).
+# - The start_time/end_time window filter returns 0 items even for
+#   windows known to contain messages, so it is NOT used. Instead we
+#   page newest-first (sort_type=ByCreateTimeDesc, end_time=now) and
+#   stop once create_time <= cursor, filtering client-side.
+# - Cursor = end of the last fully covered window, persisted in
+#   state/backfill_cursor.json. On first run there is no cursor: it is
+#   initialized to "now" so months-old history is never flooded into
+#   the inbox (26 user messages from May-Jun 2026 predate this bridge).
+# - De-dup reuses FileQueue.claim (same persistent seen_message_ids.json
+#   as live WS delivery), so a message can never be replied to twice.
+# ---------------------------------------------------------------------------
+BACKFILL_CURSOR_PATH = BASE_DIR / "state" / "backfill_cursor.json"
+BACKFILL_PAGE_SIZE = 50
+BACKFILL_MAX_PAGES = 20
+_backfill_lock = threading.Lock()
+
+
+def _read_backfill_cursor() -> int | None:
+    try:
+        data = json.loads(BACKFILL_CURSOR_PATH.read_text(encoding="utf-8"))
+        value = int(data.get("until_ms") or 0)
+        return value if value > 0 else None
+    except Exception:
+        return None
+
+
+def _write_backfill_cursor(until_ms: int) -> None:
+    try:
+        BACKFILL_CURSOR_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = BACKFILL_CURSOR_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"until_ms": int(until_ms)}), encoding="utf-8")
+        tmp.replace(BACKFILL_CURSOR_PATH)
+    except Exception:
+        pass
+
+
+def _fetch_history_page(
+    token_cache: TokenCache, chat_id: str, end_time_ms: int, page_token: str | None
+) -> dict:
+    import urllib.parse
+
+    params = {
+        "container_id_type": "chat",
+        "container_id": chat_id,
+        "page_size": str(BACKFILL_PAGE_SIZE),
+        "end_time": str(end_time_ms),
+        "sort_type": "ByCreateTimeDesc",
+    }
+    if page_token:
+        params["page_token"] = page_token
+    url = f"{BASE}/open-apis/im/v1/messages?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(
+        url, headers={"Authorization": f"Bearer {token_cache.get()}"}, method="GET"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read().decode("utf-8"))
+        except Exception:
+            return {"code": -1, "msg": f"http {e.code}"}
+
+
+def backfill_gap(queue, config: dict, token_cache: TokenCache, reason: str) -> dict:
+    """Pull whitelisted messages newer than the cursor into inbox.
+
+    Returns a stats dict. Never raises: failures are logged and the
+    cursor is left unadvanced so the next trigger retries the gap.
+    """
+    if not _backfill_lock.acquire(blocking=False):
+        log("backfill skipped: another backfill already running")
+        return {"ok": False, "skipped": "already_running"}
+    try:
+        return _backfill_gap_locked(queue, config, token_cache, reason)
+    except Exception as exc:  # never take the daemon down
+        log(f"backfill error reason={reason} error={type(exc).__name__}")
+        return {"ok": False, "error": type(exc).__name__}
+    finally:
+        _backfill_lock.release()
+
+
+def _backfill_gap_locked(queue, config: dict, token_cache: TokenCache, reason: str) -> dict:
+    now_ms = int(time.time() * 1000)
+    cursor_ms = _read_backfill_cursor()
+    if cursor_ms is None:
+        _write_backfill_cursor(now_ms)
+        log(f"backfill cursor initialized until_ms={now_ms} reason={reason}")
+        return {"ok": True, "initialized": True, "enqueued": 0}
+    try:
+        fresh = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        allowed_open = set(fresh.get("allowed_open_ids") or [])
+        allowed_chats = list(fresh.get("allowed_chat_ids") or [])
+    except Exception:
+        allowed_open = set(config.get("allowed_open_ids") or [])
+        allowed_chats = list(config.get("allowed_chat_ids") or [])
+    if not allowed_chats:
+        log("backfill skipped: no allowed_chat_ids configured")
+        return {"ok": False, "skipped": "no_allowed_chats"}
+    app_id = str(config.get("app_id") or "")
+
+    stats = {"ok": True, "enqueued": 0, "duplicate": 0, "skipped": 0, "fetched": 0}
+    all_covered = True
+    for chat_id in allowed_chats:
+        page_token: str | None = None
+        pages = 0
+        oldest_seen_ms: int | None = None
+        chat_covered = False
+        while pages < BACKFILL_MAX_PAGES:
+            pages += 1
+            data = _fetch_history_page(token_cache, chat_id, now_ms, page_token)
+            if data.get("code") != 0:
+                code = data.get("code")
+                stats["ok"] = False
+                log(
+                    f"backfill history failed chat_id_present=True code={code} "
+                    f"msg={data.get('msg')} reason={reason}"
+                )
+                if code == 99991672:
+                    log("backfill blocked: app lacks im:message:readonly; add it in the Feishu developer console and publish a new version")
+                all_covered = False
+                break
+            items = ((data.get("data") or {}).get("items") or [])
+            stats["fetched"] += len(items)
+            hit_cursor = False
+            for item in items:
+                try:
+                    create_ms = int(item.get("create_time") or 0)
+                except Exception:
+                    create_ms = 0
+                if oldest_seen_ms is None or create_ms < oldest_seen_ms:
+                    oldest_seen_ms = create_ms
+                if create_ms <= cursor_ms:
+                    hit_cursor = True
+                    break
+                sender = item.get("sender") or {}
+                sender_id = str(sender.get("id") or "")
+                if sender.get("sender_type") == "app" or (app_id and sender_id == app_id):
+                    stats["skipped"] += 1
+                    continue
+                if allowed_open and sender_id not in allowed_open:
+                    stats["skipped"] += 1
+                    continue
+                message_id = str(item.get("message_id") or "")
+                if not message_id:
+                    stats["skipped"] += 1
+                    continue
+                msg_type = str(item.get("msg_type") or "")
+                content_raw = ((item.get("body") or {}).get("content")) or "{}"
+                try:
+                    content = json.loads(content_raw) if isinstance(content_raw, str) else {}
+                except Exception:
+                    content = {}
+                text, resources, unsupported_reason = parse_incoming_content(msg_type, content)
+                if not text and not resources and not unsupported_reason:
+                    stats["skipped"] += 1
+                    continue
+                if not queue.claim(message_id):
+                    stats["duplicate"] += 1
+                    continue
+                attachments, attachment_errors = download_incoming_attachments(
+                    token_cache, message_id, resources
+                )
+                payload = {
+                    "message_id": message_id,
+                    "chat_id": str(item.get("chat_id") or chat_id),
+                    "chat_type": "",
+                    "sender_open_id": sender_id,
+                    "message_type": msg_type,
+                    "text": text,
+                    "attachments": attachments,
+                    "attachment_errors": attachment_errors,
+                    "unsupported_reason": unsupported_reason,
+                    "create_time": str(item.get("create_time") or ""),
+                    "backfilled": True,
+                }
+                queue.enqueue_inbox(payload)
+                stats["enqueued"] += 1
+            if hit_cursor:
+                chat_covered = True
+                break
+            page_token = ((data.get("data") or {}).get("page_token")) or None
+            if not ((data.get("data") or {}).get("has_more")) or not page_token:
+                chat_covered = True
+                break
+        else:
+            log(f"backfill page cap hit chat_id_present=True pages={BACKFILL_MAX_PAGES} reason={reason}")
+        if not chat_covered:
+            all_covered = False
+            # Resume next time from the oldest message actually fetched,
+            # so the cap does not silently drop the rest of the gap.
+            if oldest_seen_ms:
+                _write_backfill_cursor(oldest_seen_ms)
+    if all_covered:
+        _write_backfill_cursor(now_ms)
+    log(
+        f"backfill done reason={reason} enqueued={stats['enqueued']} "
+        f"duplicate={stats['duplicate']} skipped={stats['skipped']} "
+        f"fetched={stats['fetched']} cursor_advanced={all_covered}"
+    )
+    return stats
+
+
+def run_backfill_async(queue, config: dict, token_cache: TokenCache, reason: str) -> None:
+    """Fire-and-forget backfill from WS callbacks (never block the SDK loop)."""
+    threading.Thread(
+        target=backfill_gap, args=(queue, config, token_cache, reason), daemon=True
+    ).start()
+
+
 def heartbeat_loop(stop: threading.Event) -> None:
     HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
     while not stop.is_set():
@@ -567,6 +784,12 @@ def main() -> int:
     hb.start()
     log("heartbeat started")
 
+    # Startup backfill: this process may have been (re)started after a
+    # runtime freeze that killed the previous daemon, so cover the gap
+    # since the persisted cursor. REST history works even while WS is
+    # still connecting, and claim() de-dups anything WS delivers live.
+    run_backfill_async(queue, config, token_cache, "startup")
+
     # Import SDK here so --help / py_compile does not require it.
     import lark_oapi as lark
     from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
@@ -675,6 +898,23 @@ def main() -> int:
             ws_client = lark.ws.Client(
                 app_id, app_secret, event_handler=handler, log_level=lark.LogLevel.INFO
             )
+            # SDK reconnect hooks: on_reconnected fires on the first
+            # successful re-establishment after a drop (not on the first
+            # connect). The callback runs on the SDK event loop, so it
+            # only spawns the backfill thread and returns immediately.
+            def _on_reconnecting() -> None:
+                log("Feishu WS reconnecting; backfill will run on reconnect")
+
+            def _on_reconnected() -> None:
+                log("Feishu WS reconnected; running backfill")
+                run_backfill_async(queue, config, token_cache, "ws-reconnected")
+
+            ws_client.on_reconnecting = _on_reconnecting
+            ws_client.on_reconnected = _on_reconnected
+            # start() returning means the SDK gave up or the outer loop is
+            # rebuilding the client: cover the gap via REST as well.
+            if attempt > 1:
+                run_backfill_async(queue, config, token_cache, "ws-client-rebuilt")
             try:
                 ws_client.start()
                 log("Feishu WS start returned unexpectedly; will reconnect")

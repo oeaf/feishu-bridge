@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 from pathlib import Path
 
 
@@ -33,6 +34,9 @@ class FileQueue:
         for d in (self.inbox, self.outbox, self.processed, self.state_file.parent):
             d.mkdir(parents=True, exist_ok=True)
         self._seen: set[str] = set()
+        # claim() is called from both the WS event thread and the
+        # backfill thread; serialize the check-and-record step.
+        self._lock = threading.Lock()
         if self.state_file.exists():
             try:
                 self._seen = set(json.loads(self.state_file.read_text(encoding="utf-8")))
@@ -41,10 +45,13 @@ class FileQueue:
 
     def claim(self, message_id: str) -> bool:
         """Return True only the first time a message_id is claimed."""
-        if not message_id or message_id in self._seen:
+        if not message_id:
             return False
-        self._seen.add(message_id)
-        _atomic_write_json(self.state_file, sorted(self._seen))
+        with self._lock:
+            if message_id in self._seen:
+                return False
+            self._seen.add(message_id)
+            _atomic_write_json(self.state_file, sorted(self._seen))
         return True
 
     def enqueue_inbox(self, payload: dict) -> Path:
