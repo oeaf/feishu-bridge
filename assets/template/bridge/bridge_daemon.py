@@ -19,14 +19,10 @@ Logging is sanitized: no secrets, no full tokens.
 from __future__ import annotations
 
 import json
-import mimetypes
-import os
-import re
 import sys
 import threading
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -37,8 +33,6 @@ LOG_PATH = BASE_DIR / "logs" / "daemon.log"
 BASE = "https://open.feishu.cn"
 TOKEN_URL = f"{BASE}/open-apis/auth/v3/tenant_access_token/internal"
 SEND_URL = f"{BASE}/open-apis/im/v1/messages?receive_id_type=chat_id"
-INCOMING_ATTACHMENTS_DIR = BASE_DIR / "queue" / "incoming_attachments"
-MAX_INCOMING_ATTACHMENT_BYTES = 100 * 1024 * 1024
 
 
 def log(msg: str) -> None:
@@ -88,222 +82,6 @@ class TokenCache:
             self._token = data["tenant_access_token"]
             self._expires_at = now + int(data.get("expire") or 7200)
             return self._token
-
-
-def _safe_filename(name: object, fallback: str) -> str:
-    raw = str(name or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
-    raw = re.sub(r"[^\w.-]+", "_", raw, flags=re.UNICODE).strip("._")
-    return raw[:120] or fallback
-
-
-def _extension_for(filename: object, content_type: str, kind: str) -> str:
-    suffix = Path(str(filename or "")).suffix.lower()
-    if suffix and len(suffix) <= 10:
-        return suffix
-    guessed = mimetypes.guess_extension((content_type or "").split(";", 1)[0].strip())
-    if guessed:
-        return ".jpg" if guessed == ".jpe" else guessed
-    return {"video": ".mp4", "image": ".png", "audio": ".mp3"}.get(kind, ".bin")
-
-
-def download_message_resource(
-    token_cache: TokenCache, message_id: str, resource: dict, index: int = 1
-) -> dict:
-    """Download one user-sent Feishu message resource to local storage.
-
-    The returned dict deliberately contains the local path and display
-    metadata only; the Feishu resource key stays inside this process.
-    """
-    kind = str(resource.get("kind") or "file")
-    resource_key = str(resource.get("resource_key") or "")
-    resource_type = str(resource.get("resource_type") or "file")
-    original_name = str(resource.get("file_name") or "")
-    if not message_id or not resource_key:
-        raise RuntimeError("missing message resource key")
-
-    url = (
-        f"{BASE}/open-apis/im/v1/messages/"
-        f"{urllib.parse.quote(message_id, safe='')}/resources/"
-        f"{urllib.parse.quote(resource_key, safe='')}?type="
-        f"{urllib.parse.quote(resource_type, safe='')}"
-    )
-    req = urllib.request.Request(
-        url,
-        headers={"Authorization": f"Bearer {token_cache.get()}"},
-        method="GET",
-    )
-    dest_dir = INCOMING_ATTACHMENTS_DIR / _safe_filename(message_id, "message")
-    dest_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        response_ctx = urllib.request.urlopen(req, timeout=120)
-    except urllib.error.HTTPError as e:
-        code = None
-        msg = f"http {e.code}"
-        try:
-            data = json.loads(e.read().decode("utf-8"))
-            code = data.get("code")
-            msg = str(data.get("msg") or msg)
-        except Exception:
-            pass
-        raise RuntimeError(f"download failed code={code} msg={msg}") from None
-
-    with response_ctx as resp:
-        content_type = (resp.headers.get("Content-Type") or "").split(";", 1)[0].strip()
-        if content_type == "application/json":
-            try:
-                data = json.loads(resp.read().decode("utf-8"))
-                raise RuntimeError(
-                    f"download failed code={data.get('code')} msg={data.get('msg')}"
-                )
-            except RuntimeError:
-                raise
-            except Exception:
-                raise RuntimeError("download failed: unexpected JSON response") from None
-        content_length = resp.headers.get("Content-Length")
-        if content_length:
-            try:
-                if int(content_length) > MAX_INCOMING_ATTACHMENT_BYTES:
-                    raise RuntimeError("download failed: resource exceeds 100 MB limit")
-            except ValueError:
-                pass
-
-        safe_name = _safe_filename(original_name, kind)
-        if not Path(safe_name).suffix:
-            safe_name += _extension_for(original_name, content_type, kind)
-        dest = dest_dir / f"{index:02d}-{safe_name}"
-        tmp = dest.with_name(dest.name + ".part")
-        size = 0
-        try:
-            with tmp.open("wb") as f:
-                while True:
-                    chunk = resp.read(1024 * 64)
-                    if not chunk:
-                        break
-                    size += len(chunk)
-                    if size > MAX_INCOMING_ATTACHMENT_BYTES:
-                        raise RuntimeError("download failed: resource exceeds 100 MB limit")
-                    f.write(chunk)
-            if size == 0:
-                raise RuntimeError("download failed: empty resource")
-            os.chmod(tmp, 0o600)
-            tmp.replace(dest)
-        except Exception:
-            try:
-                tmp.unlink(missing_ok=True)
-            except Exception:
-                pass
-            raise
-
-    attachment = {
-        "type": kind,
-        "path": str(dest.relative_to(BASE_DIR)),
-        "file_name": original_name or dest.name,
-        "mime_type": content_type or mimetypes.guess_type(dest.name)[0] or "application/octet-stream",
-        "size_bytes": size,
-        "source": "feishu",
-    }
-    if resource.get("duration") is not None:
-        attachment["duration"] = resource.get("duration")
-    if resource.get("cover_image_key"):
-        attachment["has_cover_image"] = True
-    return attachment
-
-
-def _walk_post_content(node: object, texts: list[str], image_keys: list[str]) -> None:
-    if isinstance(node, dict):
-        tag = str(node.get("tag") or "")
-        if tag == "text" and isinstance(node.get("text"), str):
-            texts.append(node["text"])
-        if tag in {"img", "image"} and node.get("image_key"):
-            image_keys.append(str(node["image_key"]))
-        if isinstance(node.get("title"), str) and node["title"]:
-            texts.append(node["title"])
-        for value in node.values():
-            _walk_post_content(value, texts, image_keys)
-    elif isinstance(node, list):
-        for item in node:
-            _walk_post_content(item, texts, image_keys)
-
-
-def parse_incoming_content(message_type: str, content: dict) -> tuple[str, list[dict], str]:
-    """Normalize a Feishu message body into text plus downloadable resources."""
-    msg_type = (message_type or "").strip().lower()
-    if msg_type == "text":
-        return str(content.get("text") or "").strip(), [], ""
-
-    if msg_type == "post":
-        texts: list[str] = []
-        image_keys: list[str] = []
-        _walk_post_content(content, texts, image_keys)
-        resources = [
-            {"kind": "image", "resource_key": key, "resource_type": "image"}
-            for key in dict.fromkeys(image_keys)
-        ]
-        return "\n".join(t.strip() for t in texts if t.strip()), resources, ""
-
-    if msg_type == "image":
-        key = str(content.get("image_key") or "")
-        if key:
-            return "", [{"kind": "image", "resource_key": key, "resource_type": "image"}], ""
-        return "", [], "image message without image_key"
-
-    if msg_type in {"file", "audio"}:
-        key = str(content.get("file_key") or "")
-        if key:
-            resource = {
-                "kind": msg_type,
-                "resource_key": key,
-                "resource_type": "file",
-                "file_name": str(content.get("file_name") or ""),
-            }
-            if content.get("duration") is not None:
-                resource["duration"] = content.get("duration")
-            return "", [resource], ""
-        return "", [], f"{msg_type} message without file_key"
-
-    if msg_type == "media":
-        key = str(content.get("file_key") or "")
-        if key:
-            resource = {
-                "kind": "video",
-                "resource_key": key,
-                "resource_type": "file",
-                "file_name": str(content.get("file_name") or ""),
-            }
-            if content.get("duration") is not None:
-                resource["duration"] = content.get("duration")
-            if content.get("image_key"):
-                resource["cover_image_key"] = str(content["image_key"])
-            return "", [resource], ""
-        return "", [], "media message without file_key"
-
-    text = str(content.get("text") or "").strip()
-    if text:
-        return text, [], ""
-    if msg_type:
-        return "", [], f"unsupported message_type={msg_type}"
-    return "", [], ""
-
-
-def download_incoming_attachments(
-    token_cache: TokenCache, message_id: str, resources: list[dict]
-) -> tuple[list[dict], list[dict]]:
-    attachments: list[dict] = []
-    errors: list[dict] = []
-    for index, resource in enumerate(resources, start=1):
-        try:
-            attachments.append(download_message_resource(token_cache, message_id, resource, index))
-        except Exception as exc:
-            errors.append(
-                {
-                    "type": str(resource.get("kind") or "file"),
-                    "file_name": str(resource.get("file_name") or ""),
-                    "stage": "download",
-                    "msg": str(exc)[:240],
-                }
-            )
-    return attachments, errors
 
 
 def _multipart(fields: dict, file_field: str, filename: str, data: bytes, content_type: str) -> tuple[bytes, str]:
@@ -529,7 +307,7 @@ def _fetch_history_page(
 
 
 def backfill_gap(queue, config: dict, token_cache: TokenCache, reason: str) -> dict:
-    """Pull whitelisted messages newer than the cursor into inbox.
+    """Pull whitelisted text messages newer than the cursor into inbox.
 
     Returns a stats dict. Never raises: failures are logged and the
     cursor is left unadvanced so the next trigger retries the gap.
@@ -607,36 +385,31 @@ def _backfill_gap_locked(queue, config: dict, token_cache: TokenCache, reason: s
                 if allowed_open and sender_id not in allowed_open:
                     stats["skipped"] += 1
                     continue
-                message_id = str(item.get("message_id") or "")
-                if not message_id:
+                if str(item.get("msg_type") or "") != "text":
                     stats["skipped"] += 1
                     continue
-                msg_type = str(item.get("msg_type") or "")
                 content_raw = ((item.get("body") or {}).get("content")) or "{}"
                 try:
                     content = json.loads(content_raw) if isinstance(content_raw, str) else {}
                 except Exception:
                     content = {}
-                text, resources, unsupported_reason = parse_incoming_content(msg_type, content)
-                if not text and not resources and not unsupported_reason:
+                text = str((content or {}).get("text") or "").strip()
+                if not text:
+                    stats["skipped"] += 1
+                    continue
+                message_id = str(item.get("message_id") or "")
+                if not message_id:
                     stats["skipped"] += 1
                     continue
                 if not queue.claim(message_id):
                     stats["duplicate"] += 1
                     continue
-                attachments, attachment_errors = download_incoming_attachments(
-                    token_cache, message_id, resources
-                )
                 payload = {
                     "message_id": message_id,
                     "chat_id": str(item.get("chat_id") or chat_id),
                     "chat_type": "",
                     "sender_open_id": sender_id,
-                    "message_type": msg_type,
                     "text": text,
-                    "attachments": attachments,
-                    "attachment_errors": attachment_errors,
-                    "unsupported_reason": unsupported_reason,
                     "create_time": str(item.get("create_time") or ""),
                     "backfilled": True,
                 }
@@ -674,15 +447,69 @@ def run_backfill_async(queue, config: dict, token_cache: TokenCache, reason: str
     ).start()
 
 
+# WS connection state, shared between the SDK callbacks / WS loop and
+# the heartbeat thread. Watchdogs judge the bridge by CONNECTION
+# liveness (this state), not by process liveness: a daemon whose WS
+# link is dead still writes process heartbeats, which is exactly the
+# blind spot that hid long disconnects in the sandbox era.
+_ws_state = {
+    "state": "starting",  # starting | connecting | connected | reconnecting
+    "since": time.time(),
+    "last_connected_ts": None,
+    "last_event_ts": None,
+}
+_ws_client_ref = {"client": None}
+
+
+def _ws_set(state: str) -> None:
+    now = time.time()
+    if _ws_state["state"] != state:
+        _ws_state["state"] = state
+        _ws_state["since"] = now
+    if state == "connected":
+        _ws_state["last_connected_ts"] = now
+
+
+def _ws_probe_connected() -> bool:
+    """Best-effort live check of the SDK connection object.
+
+    The SDK has no on-connected callback for the first connect, so the
+    heartbeat thread probes the current client's connection: a live
+    websockets connection has close_code None.
+    """
+    client = _ws_client_ref.get("client")
+    conn = getattr(client, "_conn", None) if client is not None else None
+    if conn is None:
+        return False
+    try:
+        return getattr(conn, "close_code", 0) is None
+    except Exception:
+        return False
+
+
 def heartbeat_loop(stop: threading.Event) -> None:
     HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
     while not stop.is_set():
         try:
+            if _ws_state["state"] != "connected" and _ws_probe_connected():
+                _ws_set("connected")
             payload = {
                 "ts": int(time.time()),
                 "pid": __import__("os").getpid(),
                 "started_at": int(_started_at),
                 "uptime_seconds": int(time.time() - _started_at),
+                "ws_state": _ws_state["state"],
+                "ws_state_since": int(_ws_state["since"]),
+                "ws_last_connected_ts": (
+                    int(_ws_state["last_connected_ts"])
+                    if _ws_state["last_connected_ts"]
+                    else None
+                ),
+                "ws_last_event_ts": (
+                    int(_ws_state["last_event_ts"])
+                    if _ws_state["last_event_ts"]
+                    else None
+                ),
             }
             tmp = HEARTBEAT_PATH.with_suffix(".tmp")
             tmp.write_text(json.dumps(payload), encoding="utf-8")
@@ -795,6 +622,9 @@ def main() -> int:
     from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
 
     def on_message(data: P2ImMessageReceiveV1) -> None:
+        _ws_state["last_event_ts"] = time.time()
+        if _ws_state["state"] != "connected":
+            _ws_set("connected")
         try:
             event = get_attr(data, "event")
             message = get_attr(event, "message")
@@ -804,18 +634,12 @@ def main() -> int:
             chat_id = get_attr(message, "chat_id") or ""
             chat_type = get_attr(message, "chat_type") or ""
             message_id = get_attr(message, "message_id") or ""
-            message_type = str(get_attr(message, "message_type") or "")
             content_raw = get_attr(message, "content") or "{}"
             try:
-                if isinstance(content_raw, str):
-                    content = json.loads(content_raw)
-                elif isinstance(content_raw, dict):
-                    content = content_raw
-                else:
-                    content = {}
+                content = json.loads(content_raw) if isinstance(content_raw, str) else {}
             except Exception:
                 content = {}
-            text, resources, unsupported_reason = parse_incoming_content(message_type, content)
+            text = (content.get("text") or "").strip()
 
             # Reload whitelist from disk per message so backfilling
             # allowed_open_ids takes effect on the next process start
@@ -828,25 +652,18 @@ def main() -> int:
             if allowed and open_id not in allowed:
                 log(f"inbox ignored non-whitelisted sender message_id={message_id}")
                 return
-            if not text and not resources and not unsupported_reason:
-                log(f"inbox ignored empty message_id={message_id} type={message_type}")
+            if not text:
+                log(f"inbox ignored empty/non-text message_id={message_id}")
                 return
             if not queue.claim(message_id):
                 log(f"inbox duplicate message_id={message_id}")
                 return
-            attachments, attachment_errors = download_incoming_attachments(
-                token_cache, message_id, resources
-            )
             payload = {
                 "message_id": message_id,
                 "chat_id": chat_id,
                 "chat_type": chat_type,
                 "sender_open_id": open_id,
-                "message_type": message_type,
                 "text": text,
-                "attachments": attachments,
-                "attachment_errors": attachment_errors,
-                "unsupported_reason": unsupported_reason,
                 "create_time": str(get_attr(message, "create_time") or ""),
             }
             queue.enqueue_inbox(payload)
@@ -858,11 +675,7 @@ def main() -> int:
                 )
             except Exception:
                 pass
-            log(
-                f"inbox enqueued message_id={message_id} type={message_type} "
-                f"attachments={len(attachments)} attachment_errors={len(attachment_errors)} "
-                f"chat_id_present={bool(chat_id)}"
-            )
+            log(f"inbox enqueued message_id={message_id} chat_id_present={bool(chat_id)}")
         except Exception as exc:
             log(f"on_message error={type(exc).__name__}")
 
@@ -898,14 +711,18 @@ def main() -> int:
             ws_client = lark.ws.Client(
                 app_id, app_secret, event_handler=handler, log_level=lark.LogLevel.INFO
             )
+            _ws_client_ref["client"] = ws_client
+            _ws_set("connecting")
             # SDK reconnect hooks: on_reconnected fires on the first
             # successful re-establishment after a drop (not on the first
             # connect). The callback runs on the SDK event loop, so it
             # only spawns the backfill thread and returns immediately.
             def _on_reconnecting() -> None:
+                _ws_set("reconnecting")
                 log("Feishu WS reconnecting; backfill will run on reconnect")
 
             def _on_reconnected() -> None:
+                _ws_set("connected")
                 log("Feishu WS reconnected; running backfill")
                 run_backfill_async(queue, config, token_cache, "ws-reconnected")
 
@@ -920,6 +737,7 @@ def main() -> int:
                 log("Feishu WS start returned unexpectedly; will reconnect")
             except Exception as exc:
                 log(f"Feishu WS failed error={type(exc).__name__}; will reconnect")
+            _ws_client_ref["client"] = None
             if stop.is_set():
                 break
             # A long-lived run resets backoff; short failures back off.
